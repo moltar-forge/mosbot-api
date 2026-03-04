@@ -13,6 +13,17 @@ const { recordActivityLogEventSafe } = require('../services/activityLogService')
 const { parseOpenClawConfig } = require('../utils/configParser');
 const { getJwtSecret } = require('../utils/jwt');
 
+const BUILTIN_OPENCLAW_REMAP_PREFIXES = [
+  '/home/node/.openclaw/workspace',
+  '~/.openclaw/workspace',
+  '/home/node/.openclaw',
+  '~/.openclaw',
+];
+const MAIN_WORKSPACE_REMAP_PREFIXES = new Set([
+  '/home/node/.openclaw/workspace',
+  '/~/.openclaw/workspace',
+]);
+
 // Auth middleware - require valid JWT
 const requireAuth = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -62,14 +73,81 @@ function normalizeAndValidateWorkspacePath(inputPath) {
   return normalized;
 }
 
+function getOpenClawPathRemapPrefixes() {
+  const extraPrefixes = String(config.openclaw.pathRemapPrefixes || '')
+    .split(',')
+    .map((prefix) => prefix.trim())
+    .filter(Boolean);
+
+  const combined = [...BUILTIN_OPENCLAW_REMAP_PREFIXES, ...extraPrefixes]
+    .map((prefix) => normalizeAndValidateWorkspacePath(prefix))
+    .map((prefix) => (prefix === '/' ? prefix : prefix.replace(/\/+$/, '')))
+    .filter(Boolean);
+
+  // Most specific prefix wins to avoid accidental partial remaps.
+  return [...new Set(combined)].sort((a, b) => b.length - a.length);
+}
+
+function remapWorkspacePathPrefixes(workspacePath) {
+  const prefixes = getOpenClawPathRemapPrefixes();
+
+  for (const prefix of prefixes) {
+    const isMainWorkspacePrefix = MAIN_WORKSPACE_REMAP_PREFIXES.has(prefix);
+
+    if (workspacePath === prefix) {
+      if (isMainWorkspacePrefix) {
+        return '/workspace';
+      }
+      return '/';
+    }
+
+    if (workspacePath.startsWith(`${prefix}/`)) {
+      const remapped = workspacePath.substring(prefix.length);
+      if (isMainWorkspacePrefix) {
+        return normalizeAndValidateWorkspacePath(`/workspace${remapped}`);
+      }
+      return normalizeAndValidateWorkspacePath(remapped);
+    }
+  }
+
+  return workspacePath;
+}
+
+function normalizeRemapAndValidateWorkspacePath(inputPath) {
+  const normalizedPath = normalizeAndValidateWorkspacePath(inputPath);
+  return remapWorkspacePathPrefixes(normalizedPath);
+}
+
+function resolveAgentWorkspacePath(agent) {
+  if (typeof agent?.workspace === 'string' && agent.workspace.trim()) {
+    try {
+      return normalizeRemapAndValidateWorkspacePath(agent.workspace.trim());
+    } catch (error) {
+      logger.warn('Could not normalize configured agent workspace path', {
+        agentId: agent.id || null,
+        workspace: agent.workspace,
+        error: error.message,
+      });
+      return agent.workspace.trim();
+    }
+  }
+
+  if (agent?.default === true || agent?.id === 'main') {
+    return '/workspace';
+  }
+
+  const agentId = typeof agent?.id === 'string' && agent.id.trim() ? agent.id.trim() : 'agent';
+  return `/workspace-${agentId}`;
+}
+
 /**
  * Validate that a workspace path is allowed for access
  * @param {string} workspacePath - Normalized workspace path
  * @returns {boolean} - True if path is allowed
  */
 function isAllowedWorkspacePath(workspacePath) {
-  // Allow root
-  if (workspacePath === '/') return true;
+  // Allow canonical main workspace virtual path
+  if (workspacePath === '/workspace' || workspacePath.startsWith('/workspace/')) return true;
 
   // Allow system config files
   if (workspacePath === '/openclaw.json' || workspacePath === '/org-chart.json') return true;
@@ -84,8 +162,14 @@ function isAllowedWorkspacePath(workspacePath) {
   // Allow skills directory (moved from /shared/skills to /skills)
   if (workspacePath.startsWith('/skills/') || workspacePath === '/skills') return true;
 
+  // Allow legacy archived workspace path when present
+  if (
+    workspacePath === '/_archived_workspace_main' ||
+    workspacePath.startsWith('/_archived_workspace_main/')
+  )
+    return true;
+
   // Allow agent workspaces
-  if (workspacePath.startsWith('/workspace/') || workspacePath === '/workspace') return true;
   if (workspacePath.startsWith('/workspace-') || /^\/workspace-[a-z]+(\/|$)/.test(workspacePath))
     return true;
 
@@ -113,8 +197,8 @@ function toUpdatedAtMs(val) {
 // List workspace files (all authenticated users can view metadata)
 router.get('/workspace/files', requireAuth, async (req, res, next) => {
   try {
-    const { path: inputPath = '/', recursive = 'false' } = req.query;
-    const workspacePath = normalizeAndValidateWorkspacePath(inputPath);
+    const { path: inputPath = '/workspace', recursive = 'false' } = req.query;
+    const workspacePath = normalizeRemapAndValidateWorkspacePath(inputPath);
 
     // Validate path is allowed
     if (!isAllowedWorkspacePath(workspacePath)) {
@@ -157,7 +241,7 @@ router.get('/workspace/files/content', requireAuth, async (req, res, next) => {
       });
     }
 
-    const workspacePath = normalizeAndValidateWorkspacePath(inputPath);
+    const workspacePath = normalizeRemapAndValidateWorkspacePath(inputPath);
 
     // Validate path is allowed
     if (!isAllowedWorkspacePath(workspacePath)) {
@@ -211,7 +295,18 @@ router.post('/workspace/files', requireAuth, requireAdmin, async (req, res, next
       });
     }
 
-    const workspacePath = normalizeAndValidateWorkspacePath(inputPath);
+    const workspacePath = normalizeRemapAndValidateWorkspacePath(inputPath);
+
+    // Validate path is allowed
+    if (!isAllowedWorkspacePath(workspacePath)) {
+      return res.status(403).json({
+        error: {
+          message: 'Access denied: Path not allowed',
+          status: 403,
+          code: 'PATH_NOT_ALLOWED',
+        },
+      });
+    }
 
     // Restrict system config files to admin/owner only (exclude 'agent' role)
     const isSystemConfigFile =
@@ -316,7 +411,7 @@ router.put('/workspace/files', requireAuth, requireAdmin, async (req, res, next)
       });
     }
 
-    const workspacePath = normalizeAndValidateWorkspacePath(inputPath);
+    const workspacePath = normalizeRemapAndValidateWorkspacePath(inputPath);
 
     // Validate path is allowed
     if (!isAllowedWorkspacePath(workspacePath)) {
@@ -391,7 +486,7 @@ router.delete('/workspace/files', requireAuth, requireAdmin, async (req, res, ne
       });
     }
 
-    const workspacePath = normalizeAndValidateWorkspacePath(inputPath);
+    const workspacePath = normalizeRemapAndValidateWorkspacePath(inputPath);
 
     // Validate path is allowed
     if (!isAllowedWorkspacePath(workspacePath)) {
@@ -513,7 +608,7 @@ router.get('/agents', requireAuth, async (req, res, next) => {
               title: agent.identity?.title || null,
               description: agent.identity?.theme || `${agent.identity?.name || agent.id} workspace`,
               icon: agent.identity?.emoji || '🤖',
-              workspace: agent.workspace,
+              workspace: resolveAgentWorkspacePath(agent),
               isDefault: agent.default === true,
             }))
           : [
@@ -525,7 +620,7 @@ router.get('/agents', requireAuth, async (req, res, next) => {
                 title: null,
                 description: 'Operations and workflow management',
                 icon: '📊',
-                workspace: '/home/node/.openclaw/workspace',
+                workspace: '/workspace',
                 isDefault: true,
               },
             ];
@@ -573,7 +668,7 @@ router.get('/agents', requireAuth, async (req, res, next) => {
             label: 'Chief Operating Officer',
             description: 'Operations and workflow management',
             icon: '📊',
-            workspace: '/home/node/.openclaw/workspace',
+            workspace: '/workspace',
             isDefault: true,
           },
           {
@@ -582,7 +677,7 @@ router.get('/agents', requireAuth, async (req, res, next) => {
             label: 'Archived (Old Main)',
             description: 'Archived workspace files from previous iteration',
             icon: '📦',
-            workspace: '/home/node/.openclaw/_archived_workspace_main',
+            workspace: '/_archived_workspace_main',
             isDefault: false,
           },
         ],
@@ -4224,7 +4319,7 @@ router.get('/config/backups/content', requireAuth, requireOwnerOrAdmin, async (r
       });
     }
 
-    const workspacePath = normalizeAndValidateWorkspacePath(inputPath);
+    const workspacePath = normalizeRemapAndValidateWorkspacePath(inputPath);
 
     // Restrict to backup directory only
     if (!workspacePath.startsWith('/shared/backups/openclaw-config/')) {
