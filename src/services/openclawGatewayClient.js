@@ -728,8 +728,9 @@ async function gatewayWsRpcWithDeviceAuth(method, params = {}) {
         return;
       }
 
-      // Device-auth: gateway sends connect.challenge before we send connect
-      if (msg.type === 'event' && msg.event === 'connect.challenge') {
+      // Device-auth: gateway sends connect.challenge before we send connect.
+      // Skip this for insecure-auth path — connect was already sent from the open handler.
+      if (msg.type === 'event' && msg.event === 'connect.challenge' && !useInsecureAuth) {
         const nonce = msg.payload?.nonce || '';
         doConnectAndRpc(nonce);
         return;
